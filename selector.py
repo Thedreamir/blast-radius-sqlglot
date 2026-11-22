@@ -1,6 +1,6 @@
 """Blast Radius selector: picks the tests a patch can break from a coverage map
 built on the pinned sqlglot commit (see build_map.py), then packs them onto workers."""
-import json, os, re, sys
+import json, os, re, subprocess, sys, tempfile
 from pathlib import Path
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
@@ -10,6 +10,7 @@ KW = set("self cls exp None True False and or not if else elif return for in is 
 M = json.load((HERE / "map.json").open())
 FILES, SETS, NAMES, DIAL, FX = M["files"], M["sets"], M["names"], M["dial"], M["fx"]
 ALL = None
+SG = Path(os.environ.get("BR_SQLGLOT", "/opt/sg"))   # sqlglot source at the pinned commit (see Dockerfile)
 
 
 def sset(i):
@@ -97,6 +98,9 @@ def full():
     return ALL
 
 
+GATE = set()   # files whose patch touched import-time lines
+
+
 def select_source(path, hunks):
     fi = FILES.get(path)
     if fi is None:
@@ -125,6 +129,7 @@ def select_source(path, hunks):
                     if u is None:
                         return None
                     if n in imp:
+                        GATE.add(path)
                         r = import_time(path, fi, n, rem, add, u)
                         if r is None: return None
                         sel |= r
@@ -138,10 +143,22 @@ def select_source(path, hunks):
                 if f is not None and n not in imp:
                     sel |= tests_for_range(fi, f[0], f[1], path)
                 else:
+                    GATE.add(path)
                     r = import_time(path, fi, n, rem, add, unit.get(str(n)))
                     if r is None: return None
                     sel |= r
     return sel
+
+
+LIT = re.compile(r"""("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\b0[xX][0-9a-fA-F_]+\b|\b\d[\d_]*(?:\.\d+)?\b|\bTrue\b|\bFalse\b|\bNone\b)""")
+
+
+def literal_only(rem, add):
+    """True when the block differs only in literal values (numbers, strings, True/False/None)."""
+    if len(rem) != len(add):
+        return False
+    mask = lambda t: LIT.sub("0", t)
+    return all(mask(r) == mask(a) for (_, r), a in zip(rem, add))
 
 
 def import_time(path, fi, n, rem, add, u):
@@ -157,9 +174,13 @@ def import_time(path, fi, n, rem, add, u):
         hits = set()
         for t in toks:
             if t in NAMES: hits |= sset(NAMES[t])
-        dset = sset(DIAL[d])
-        sel |= (dset & hits) if hits else dset
+        sel |= sset(DIAL[d])
         return sel
+    # shared code (generator, parser, expressions, optimizer, ...): other modules may read the changed name while
+    # they are being built, which no per-test coverage can show. Only a pure literal swap is analysed; any other
+    # class or module level edit runs the full suite.
+    if not literal_only(rem, add):
+        return None
     hit = False
     for t in toks:
         if t in NAMES:
@@ -176,15 +197,152 @@ def select_fixture(path):
     return sset(v)
 
 
+def apply_hunks(orig, raw_hunks):
+    """Apply unified-diff hunks (old_start, lines with ' ', '-', '+' prefixes) to text; None if they do not fit."""
+    lines = orig.split("\n")
+    out, pos = [], 0
+    for old_start, hl in raw_hunks:
+        start = old_start - 1 if any(not l.startswith("+") for l in hl) else old_start
+        if start < pos or start > len(lines):
+            return None
+        out.extend(lines[pos:start]); pos = start
+        for l in hl:
+            if l.startswith("+"):
+                out.append(l[1:])
+            else:
+                if pos >= len(lines) or lines[pos] != l[1:]:
+                    return None
+                if l.startswith(" "):
+                    out.append(lines[pos])
+                pos += 1
+    out.extend(lines[pos:])
+    return "\n".join(out)
+
+
+def raw_hunks(patch_text):
+    res, cur, hunks, ok = {}, None, None, True
+    ls = patch_text.split("\n")
+    if ls and ls[-1] == "":
+        ls.pop()
+    for line in ls:
+        if line.startswith("diff --git "):
+            m = re.match(r"diff --git a/(\S+) b/(\S+)", line)
+            cur = m.group(1); hunks = res.setdefault(cur, []); h = None
+        elif cur is None:
+            continue
+        elif line.startswith("@@"):
+            m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+            h = (int(m.group(1)), []); hunks.append(h)
+        elif line.startswith(("---", "+++")) and h is None:
+            continue
+        elif h is not None and line[:1] in ("+", "-", " "):
+            h[1].append(line)
+        elif h is not None and line == "":
+            h[1].append(" ")
+    return res
+
+
+def conservative(path):
+    """Tests that would fail if this module could not be imported."""
+    v = M.get("fp", {}).get(path)
+    if v is None:
+        return None
+    if "in" in v:
+        return set(v["in"])
+    return full() - set(v["not"])
+
+
+def import_gate(patch_text, changed):
+    """Apply the patch to a copy of sqlglot and check it still imports. Returns the tests that fail when it does not,
+    or None (-> full suite) when this cannot be judged."""
+    raw = raw_hunks(patch_text)
+    patched = {}
+    for p in changed:
+        try:
+            orig = (SG / p).read_text(encoding="utf-8")
+        except OSError:
+            return None
+        new = apply_hunks(orig, raw.get(p, []))
+        if new is None:
+            return None
+        patched[p] = new
+    bad = set()
+    deep = [p for p in changed if p in GATE]
+    for p, text in patched.items():
+        try:
+            compile(text, p, "exec")
+        except (SyntaxError, ValueError):
+            c = conservative(p)
+            if c is None: return None
+            bad |= c
+    if bad:
+        return bad
+    if not deep:
+        return bad
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "sqlglot"
+        root.mkdir()
+        prefix = "sqlglot/"
+        def mirror(src, dst, rel):
+            dst.mkdir(exist_ok=True)
+            for e in os.scandir(src):
+                r = rel + e.name
+                if e.name == "__pycache__":
+                    continue
+                if e.is_dir():
+                    if any(c.startswith(r + "/") for c in patched):
+                        mirror(e.path, dst / e.name, r + "/")
+                    else:
+                        os.symlink(e.path, dst / e.name)
+                elif r in patched:
+                    (dst / e.name).write_text(patched[r], encoding="utf-8")
+                else:
+                    os.symlink(e.path, dst / e.name)
+        mirror(str(SG / "sqlglot"), root, "sqlglot/")
+        # A class or module body edit can break the import of modules that build on it while the edited module
+        # itself still imports, so every module of the package is imported, not only the touched ones.
+        mods = []
+        for dp, dn, fn in os.walk(SG / "sqlglot"):
+            dn[:] = sorted(d for d in dn if d != "__pycache__")
+            for f in sorted(fn):
+                if f.endswith(".py") and f != "__main__.py":
+                    rel = os.path.relpath(os.path.join(dp, f), SG)[:-3].replace(os.sep, ".")
+                    mods.append(rel[:-9] if rel.endswith(".__init__") else rel)
+        code = ("import importlib,sys\n"
+                "bad=[]\n"
+                "try:\n import sqlglot\n"
+                "except BaseException:\n print('CORE'); sys.exit(0)\n"
+                "for m in sys.argv[1:]:\n"
+                " try: importlib.import_module(m)\n"
+                " except BaseException: bad.append(m)\n"
+                "print(' '.join(bad))\n")
+        env = dict(os.environ, PYTHONPATH=td, PYTHONDONTWRITEBYTECODE="1")
+        r = subprocess.run([sys.executable, "-c", code] + mods, capture_output=True, text=True, env=env, timeout=60)
+        if r.returncode != 0:
+            print('gate error', r.stderr[-400:], file=sys.stderr)
+            return None
+        out = r.stdout.strip()
+        if out == "CORE":
+            return full()
+        for m in out.split():
+            c = conservative(m.replace(".", "/") + ".py") or conservative(m.replace(".", "/") + "/__init__.py")
+            if c is None: return None
+            bad |= c
+    return bad
+
+
 def select_commit(patch_text):
     files = parse_patch(patch_text)
     if not files:
         return full()
+    GATE.clear()
     sel = set()
+    changed = []
     for p, info in files.items():
         if info["binary"] or info["special"] or info["old"] != info["new"]:
             return full()
         if p.startswith("sqlglot/") and p.endswith(".py"):
+            changed.append(p)
             r = select_source(p, info["hunks"])
         elif p.startswith("tests/fixtures/"):
             r = select_fixture(p)
@@ -197,6 +355,11 @@ def select_commit(patch_text):
         if r is None:
             return full()
         sel |= r
+    if changed and sel is not None:
+        g = import_gate(patch_text, changed)
+        if g is None:
+            return full()
+        sel |= g
     return sel
 
 
@@ -237,7 +400,10 @@ def main():
         ws = pack(sel, secs)
         out = [[idx2num[i] for i in w if idx2num[i] is not None] for w in ws]
         if sel and unknown:
-            out[0] = out[0] + unknown  # tests this map never saw: always run them
+            if out:
+                out[0] = out[0] + unknown  # tests this map never saw: always run them
+            else:
+                out = [unknown]
         print(json.dumps({"commit": p.stem, "workers": [w for w in out if w]}))
 
 
