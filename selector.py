@@ -161,6 +161,37 @@ def literal_only(rem, add):
     return all(mask(r) == mask(a) for (_, r), a in zip(rem, add))
 
 
+def ancestors(name, graph):
+    out, todo = set(), list(graph.get(name, []))
+    while todo:
+        b = todo.pop()
+        if b not in out:
+            out.add(b); todo.extend(graph.get(b, []))
+    return out
+
+
+def class_attr(path, n, base):
+    """A literal change to an attribute in the body of a plain expression class only matters to code that builds
+    an instance of that class or of a subclass (see build_creators.py). Function classes are built from SQL text by
+    name, and classes read at import time keep the broad path."""
+    spans = M.get("clsline", {}).get(path)
+    cr = M.get("creators")
+    if not spans or not cr:
+        return None
+    graph = M["cls"]
+    for start, end, name, body in spans:
+        if any(a <= n <= b for a, b in body):
+            fam = {name} | {c for c in graph if name in ancestors(c, graph)}
+            sel = set(base)
+            for c in fam:
+                v = cr.get(c)
+                if v is None or v["imp"]:
+                    return None
+                sel |= set(v["tests"])
+            return sel
+    return None
+
+
 def import_time(path, fi, n, rem, add, u):
     """Change to module/class level code: it runs at import, so find who depends on it."""
     sel = set(M["sub"])
@@ -181,6 +212,9 @@ def import_time(path, fi, n, rem, add, u):
     # class or module level edit runs the full suite.
     if not literal_only(rem, add):
         return None
+    r = class_attr(path, n, set(M["sub"]))
+    if r is not None:
+        return r
     hit = False
     for t in toks:
         if t in NAMES:
